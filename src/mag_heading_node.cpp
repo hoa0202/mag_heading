@@ -105,74 +105,270 @@ private:
     double prev_mag_heading_ = 0.0;
     int mag_stable_count_ = 0;
     static constexpr int MAG_STABLE_THRESHOLD = 10;
+    
+    // 🔒 안전한 각도 정규화 함수 (무한루프 방지)
+    double normalizeAngle(double angle) {
+        // NaN이나 무한대 체크
+        if (!std::isfinite(angle)) {
+            RCLCPP_WARN(this->get_logger(), "비정상 각도 감지: %f → 0으로 초기화", angle);
+            return 0.0;
+        }
+        
+        // 안전한 정규화 (최대 2번만 시도)
+        angle = std::fmod(angle + M_PI, 2.0 * M_PI) - M_PI;
+        
+        // 다시 한번 유효성 확인
+        if (!std::isfinite(angle)) {
+            RCLCPP_ERROR(this->get_logger(), "정규화 실패! 0으로 초기화");
+            return 0.0;
+        }
+        
+        return angle;
+    }
+    
+    // 🛡️ 안전한 RPY 추출 (tf2 블로킹 방지)
+    bool safeGetRPY(const tf2::Quaternion& quat, double& roll, double& pitch, double& yaw) {
+        try {
+            // 쿼터니언 유효성 체크
+            if (!std::isfinite(quat.x()) || !std::isfinite(quat.y()) || 
+                !std::isfinite(quat.z()) || !std::isfinite(quat.w())) {
+                RCLCPP_WARN(this->get_logger(), "쿼터니언 비정상: [%.3f, %.3f, %.3f, %.3f]", 
+                           quat.x(), quat.y(), quat.z(), quat.w());
+                return false;
+            }
+            
+            // 쿼터니언 정규화 확인
+            double norm = quat.length();
+            if (norm < 0.9 || norm > 1.1) {  // 10% 오차 허용
+                RCLCPP_WARN(this->get_logger(), "쿼터니언 크기 비정상: %.3f", norm);
+                return false;
+            }
+            
+            // 수동 RPY 계산 (tf2 getRPY 대신)
+            double test = quat.x()*quat.y() + quat.z()*quat.w();
+            
+            // Gimbal lock 체크
+            if (test > 0.499) { // singularity at north pole
+                yaw = 2 * atan2(quat.x(), quat.w());
+                pitch = M_PI/2;
+                roll = 0;
+                RCLCPP_DEBUG(this->get_logger(), "Gimbal lock (북극)");
+                return true;
+            }
+            if (test < -0.499) { // singularity at south pole
+                yaw = -2 * atan2(quat.x(), quat.w());
+                pitch = -M_PI/2;
+                roll = 0;
+                RCLCPP_DEBUG(this->get_logger(), "Gimbal lock (남극)");
+                return true;
+            }
+            
+            // 정상 계산
+            double sqx = quat.x()*quat.x();
+            double sqy = quat.y()*quat.y();
+            double sqz = quat.z()*quat.z();
+            
+            yaw = atan2(2*quat.y()*quat.w()-2*quat.x()*quat.z() , 1 - 2*sqy - 2*sqz);
+            pitch = asin(2*test);
+            roll = atan2(2*quat.x()*quat.w()-2*quat.y()*quat.z() , 1 - 2*sqx - 2*sqz);
+            
+            // 결과 유효성 체크
+            if (!std::isfinite(roll) || !std::isfinite(pitch) || !std::isfinite(yaw)) {
+                RCLCPP_WARN(this->get_logger(), "RPY 계산 결과 비정상: R=%.3f P=%.3f Y=%.3f", roll, pitch, yaw);
+                return false;
+            }
+            
+            return true;
+        }
+        catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "RPY 추출 오류: %s", e.what());
+            return false;
+        }
+        catch (...) {
+            RCLCPP_ERROR(this->get_logger(), "RPY 추출 알 수 없는 오류");
+            return false;
+        }
+    }
+
+    // 🛡️ 순수 쿼터니언 기반 yaw 추출 (RPY 변환 없음, Gimbal lock 없음)
+    double extractYawFromQuaternion(const tf2::Quaternion& quat) {
+        try {
+            RCLCPP_INFO(this->get_logger(), "extractYaw: 시작");
+            
+            // 쿼터니언 정규화 확인
+            if (!std::isfinite(quat.x()) || !std::isfinite(quat.y()) || 
+                !std::isfinite(quat.z()) || !std::isfinite(quat.w())) {
+                RCLCPP_WARN(this->get_logger(), "쿼터니언 비정상");
+                return 0.0;
+            }
+            
+            RCLCPP_INFO(this->get_logger(), "extractYaw: 유효성 체크 완료");
+            
+            // Z축(yaw) 성분만 추출 (순수 쿼터니언 연산)
+            // quat = (w, x, y, z) = (cos(θ/2), sin(θ/2)*axis)
+            // yaw 성분: atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+            
+            double w = quat.w();
+            double x = quat.x(); 
+            double y = quat.y();
+            double z = quat.z();
+            
+            RCLCPP_INFO(this->get_logger(), "extractYaw: 쿼터니언 성분 추출 완료");
+            
+            // 직접 yaw 계산 (Gimbal lock 없음)
+            double yaw = atan2(2.0 * (w*z + x*y), 1.0 - 2.0 * (y*y + z*z));
+            
+            RCLCPP_INFO(this->get_logger(), "extractYaw: atan2 계산 완료");
+            
+            if (!std::isfinite(yaw)) {
+                RCLCPP_WARN(this->get_logger(), "Yaw 계산 실패");
+                return 0.0;
+            }
+            
+            RCLCPP_INFO(this->get_logger(), "extractYaw: 완료");
+            return yaw;
+        }
+        catch (...) {
+            RCLCPP_ERROR(this->get_logger(), "쿼터니언 yaw 추출 오류");
+            return 0.0;
+        }
+    }
+    
+    // 🛡️ 순수 쿼터니언 기반 절대 IMU 생성 (RPY 변환 없음)
+    tf2::Quaternion createAbsoluteIMU(const tf2::Quaternion& original_quat, double absolute_yaw) {
+        try {
+            RCLCPP_INFO(this->get_logger(), "createAbsolute: 시작");
+            
+            // Z축 회전만 교체하는 순수 쿼터니언 연산
+            // 1. 현재 yaw 추출
+            double current_yaw = extractYawFromQuaternion(original_quat);
+            
+            RCLCPP_INFO(this->get_logger(), "createAbsolute: 현재 yaw 추출 완료");
+            
+            // 2. yaw 차이 계산
+            double yaw_diff = absolute_yaw - current_yaw;
+            yaw_diff = normalizeAngle(yaw_diff);
+            
+            RCLCPP_INFO(this->get_logger(), "createAbsolute: yaw 차이 계산 완료");
+            
+            // 3. Z축 회전 쿼터니언 생성 (yaw 차이만큼)
+            tf2::Quaternion yaw_rotation;
+            yaw_rotation.setRotation(tf2::Vector3(0, 0, 1), yaw_diff);
+            
+            RCLCPP_INFO(this->get_logger(), "createAbsolute: Z축 회전 쿼터니언 생성 완료");
+            
+            // 4. 원본에 Z축 회전 적용
+            tf2::Quaternion result = yaw_rotation * original_quat;
+            result.normalize();
+            
+            RCLCPP_INFO(this->get_logger(), "createAbsolute: 완료");
+            return result;
+        }
+        catch (...) {
+            RCLCPP_ERROR(this->get_logger(), "절대 IMU 생성 오류");
+            return original_quat;  // 실패시 원본 반환
+        }
+    }
 
     void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
     {
-        // IMU 데이터 유효성 검사
-        tf2::Quaternion test_quat(msg->orientation.x, msg->orientation.y, 
-                                 msg->orientation.z, msg->orientation.w);
-        
-        // 쿼터니언 정규화 (중요!)
-        test_quat.normalize();
-        
-        // 정규화된 쿼터니언으로 IMU 메시지 업데이트
-        auto normalized_imu = std::make_shared<sensor_msgs::msg::Imu>(*msg);
-        normalized_imu->orientation.x = test_quat.x();
-        normalized_imu->orientation.y = test_quat.y();
-        normalized_imu->orientation.z = test_quat.z();
-        normalized_imu->orientation.w = test_quat.w();
-        
-        // 원시 IMU의 yaw 추출
-        tf2::Matrix3x3 rot(test_quat);
-        double roll, pitch, current_raw_yaw;
-        rot.getRPY(roll, pitch, current_raw_yaw);
-        
-        // 이전 IMU 데이터와 비교해서 yaw 변화량 계산
-        if (latest_imu_) {
-            tf2::Quaternion prev_quat(latest_imu_->orientation.x, latest_imu_->orientation.y,
-                                     latest_imu_->orientation.z, latest_imu_->orientation.w);
-            tf2::Matrix3x3 prev_rot(prev_quat);
-            double prev_roll, prev_pitch, prev_raw_yaw;
-            prev_rot.getRPY(prev_roll, prev_pitch, prev_raw_yaw);
+        try {
+            // IMU 데이터 유효성 검사
+            tf2::Quaternion test_quat(msg->orientation.x, msg->orientation.y, 
+                                     msg->orientation.z, msg->orientation.w);
             
-            // Yaw 변화량 계산 (각도 점프 처리)
-            double yaw_change = current_raw_yaw - prev_raw_yaw;
-            while (yaw_change > M_PI) yaw_change -= 2.0 * M_PI;
-            while (yaw_change <= -M_PI) yaw_change += 2.0 * M_PI;
+            // 쿼터니언 정규화 (중요!)
+            test_quat.normalize();
             
-            // 정지 상태 감지
-            if (abs(yaw_change) < STATIONARY_THRESHOLD) {
-                stationary_count_++;
-            } else {
-                stationary_count_ = 0;  // 움직임 감지시 리셋
+            // 정규화된 쿼터니언으로 IMU 메시지 업데이트
+            auto normalized_imu = std::make_shared<sensor_msgs::msg::Imu>(*msg);
+            normalized_imu->orientation.x = test_quat.x();
+            normalized_imu->orientation.y = test_quat.y();
+            normalized_imu->orientation.z = test_quat.z();
+            normalized_imu->orientation.w = test_quat.w();
+            
+            // 원시 IMU의 yaw 추출 (순수 쿼터니언 연산)
+            double current_raw_yaw = extractYawFromQuaternion(test_quat);
+            
+            // 🔒 yaw 유효성 확인  
+            if (!std::isfinite(current_raw_yaw)) {
+                RCLCPP_WARN(this->get_logger(), "IMU yaw 추출 실패 - 데이터 무시");
+                return;  // 실패시 무시
             }
             
-            // 융합된 heading에 실제 yaw 변화량 적용
-            if (filter_initialized_) {
-                fused_heading_ += yaw_change;
-                gyro_heading_ += yaw_change;
+            // 이전 IMU 데이터와 비교해서 yaw 변화량 계산
+            if (latest_imu_) {
+                tf2::Quaternion prev_quat(latest_imu_->orientation.x, latest_imu_->orientation.y,
+                                         latest_imu_->orientation.z, latest_imu_->orientation.w);
+                double prev_raw_yaw = extractYawFromQuaternion(prev_quat);
                 
-                // -π ~ π 정규화
-                while (fused_heading_ > M_PI) fused_heading_ -= 2.0 * M_PI;
-                while (fused_heading_ <= -M_PI) fused_heading_ += 2.0 * M_PI;
-                while (gyro_heading_ > M_PI) gyro_heading_ -= 2.0 * M_PI;
-                while (gyro_heading_ <= -M_PI) gyro_heading_ += 2.0 * M_PI;
+                if (!std::isfinite(prev_raw_yaw)) {
+                    RCLCPP_WARN(this->get_logger(), "이전 IMU yaw 추출 실패");
+                    // 이전 데이터 문제면 현재를 이전으로 저장하고 변화량은 0으로
+                    prev_raw_yaw_ = current_raw_yaw;
+                    latest_imu_ = normalized_imu;
+                    last_imu_time_ = msg->header.stamp;
+                    return;
+                }
+                
+                // Yaw 변화량 계산 (각도 점프 처리)
+                double yaw_change = current_raw_yaw - prev_raw_yaw;
+                yaw_change = normalizeAngle(yaw_change);  // 안전한 정규화
+                
+                // 정지 상태 감지
+                if (abs(yaw_change) < STATIONARY_THRESHOLD) {
+                    stationary_count_++;
+                } else {
+                    stationary_count_ = 0;  // 움직임 감지시 리셋
+                }
+                
+                // 융합된 heading에 실제 yaw 변화량 적용
+                if (filter_initialized_) {
+                    fused_heading_ += yaw_change;
+                    gyro_heading_ += yaw_change;
+                    
+                    // 안전한 정규화
+                    fused_heading_ = normalizeAngle(fused_heading_);
+                    gyro_heading_ = normalizeAngle(gyro_heading_);
+                }
             }
+            
+            prev_raw_yaw_ = current_raw_yaw;  // 다음 비교를 위해 저장
+            
+            latest_imu_ = normalized_imu;
+            last_imu_time_ = msg->header.stamp;
+            
+            // 🔍 IMU 콜백 로그 (항상 출력)
+            double raw_yaw_deg = current_raw_yaw * 180.0 / M_PI;
+            if (raw_yaw_deg < 0) raw_yaw_deg += 360.0;
+            
+            RCLCPP_INFO(this->get_logger(), 
+                "imu_main 토픽 데이터: Y=%.1f° | 시간=%ld.%09ld", 
+                raw_yaw_deg, msg->header.stamp.sec, msg->header.stamp.nanosec);
         }
-        
-        prev_raw_yaw_ = current_raw_yaw;  // 다음 비교를 위해 저장
-        
-        latest_imu_ = normalized_imu;
-        last_imu_time_ = msg->header.stamp;
+        catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "IMU 콜백 오류: %s", e.what());
+        }
+        catch (...) {
+            RCLCPP_ERROR(this->get_logger(), "IMU 콜백 알 수 없는 오류");
+        }
     }
     
     void magnetometerCallback(const sensor_msgs::msg::MagneticField::SharedPtr msg)
     {
-        if (!is_calibrated_) {
-            collectCalibrationData(msg);
-            checkCalibrationComplete();
-        } else {
-            publishCorrectedHeading(msg);
+        try {
+            if (!is_calibrated_) {
+                collectCalibrationData(msg);
+                checkCalibrationComplete();
+            } else {
+                publishCorrectedHeading(msg);
+            }
+        }
+        catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "자력계 콜백 오류: %s", e.what());
+        }
+        catch (...) {
+            RCLCPP_ERROR(this->get_logger(), "자력계 콜백 알 수 없는 오류");
         }
     }
     
@@ -278,34 +474,97 @@ private:
     {
         if (!latest_imu_) return;
         
+        // 🔍 자력계 콜백 시작 로그 (항상 출력)
+        RCLCPP_INFO(this->get_logger(), "magnetometer_main 토픽 데이터 처리 시작");
+        
+        // 🔍 1단계: 자력계 보정 시작
+        RCLCPP_INFO(this->get_logger(), "1단계: 자력계 데이터 읽기 및 품질 체크");
+        
         // 자력계 보정
         Eigen::Vector3d mag_raw(msg->magnetic_field.x, 
                                msg->magnetic_field.y, 
                                msg->magnetic_field.z);
         
-        // 자력계 품질 체크 (관대하게)
+        // 🔍 자력계 크기 항상 출력 (디버깅용)
         double mag_magnitude = mag_raw.norm();
+        RCLCPP_INFO(this->get_logger(), "🔍 자력계 크기: %.2fe-5 (범위: 2e-5 ~ 8e-5)", mag_magnitude*1e5);
+        
+        // 자력계 품질 체크 (관대하게)
         if (mag_magnitude < 2e-5 || mag_magnitude > 8e-5) {
             consecutive_good_readings_ = 0;
+            RCLCPP_WARN(this->get_logger(), "자력계 품질 불량 (%.2fe-5) - 자력계 보정 없이 IMU만 발행", mag_magnitude*1e5);
+            
+            // 🔧 자력계 불량이어도 IMU는 발행! (자력계 보정 없이)
+            publishIMUOnly();
             return;
         }
         consecutive_good_readings_++;
         
+        RCLCPP_INFO(this->get_logger(), "1단계 성공: 자력계 품질 통과");
+        
+        // 🔍 2단계: 자력계 보정 계산
+        RCLCPP_INFO(this->get_logger(), "2단계: 자력계 보정 계산");
+        
         Eigen::Vector3d mag_corrected = soft_iron_matrix_ * (mag_raw - hard_iron_offset_);
         
-        // IMU 쿼터니언을 회전행렬로 변환
-        tf2::Quaternion q(latest_imu_->orientation.x, latest_imu_->orientation.y,
-                         latest_imu_->orientation.z, latest_imu_->orientation.w);
-        tf2::Matrix3x3 R(q);
+        // 🔍 3단계: 틸트 보정 시작  
+        RCLCPP_INFO(this->get_logger(), "3단계: 틸트 보정 시작");
         
-        // Tilt 보정: 자력계를 수평면으로 투영
-        tf2::Vector3 mag_tf(mag_corrected.x(), mag_corrected.y(), mag_corrected.z());
-        tf2::Vector3 mag_horizontal = R.transpose() * mag_tf;
+        // 틸트 보정 (pitch/roll 보상)
+        if (latest_imu_) {
+            tf2::Quaternion imu_quat(latest_imu_->orientation.x, latest_imu_->orientation.y,
+                                     latest_imu_->orientation.z, latest_imu_->orientation.w);
+            imu_quat.normalize();
+            
+            // 🔍 3-1단계: 회전 행렬 생성
+            RCLCPP_INFO(this->get_logger(), "3-1단계: 회전 행렬 생성");
+            
+            tf2::Matrix3x3 rotation_matrix(imu_quat);
+            
+            // 🔍 3-2단계: 3x3 회전 행렬을 이용한 tilt 보정
+            RCLCPP_INFO(this->get_logger(), "3-2단계: 벡터 변환 시작");
+            
+            tf2::Vector3 mag_vector(mag_corrected.x(), mag_corrected.y(), mag_corrected.z());
+            
+            // 🔍 3-3단계: transpose 계산 (이게 블로킹 원인일 수 있음!)
+            RCLCPP_INFO(this->get_logger(), "3-3단계: transpose 계산");
+            
+            // 🛡️ 안전한 역변환: 회전 행렬의 경우 transpose = inverse
+            tf2::Matrix3x3 rotation_transpose = rotation_matrix.transpose();
+            
+            // 🔍 3-4단계: 벡터 곱셈 (이것도 블로킹 가능!)
+            RCLCPP_INFO(this->get_logger(), "3-4단계: 벡터 곱셈");
+            
+            tf2::Vector3 horizontal_mag = rotation_transpose * mag_vector;
+            
+            // 🔍 3-5단계: 수평면 투영
+            RCLCPP_INFO(this->get_logger(), "3-5단계: 수평면 투영");
+            
+            // 수평면으로 투영된 자력계 벡터 (Z=0)
+            tf2::Vector3 mag_horizontal(horizontal_mag.x(), horizontal_mag.y(), 0.0);
+            
+            // 🔒 틸트 보정 결과 유효성 체크
+            if (!std::isfinite(mag_horizontal.x()) || !std::isfinite(mag_horizontal.y())) {
+                RCLCPP_WARN(this->get_logger(), "틸트 보정 실패: X=%.3f Y=%.3f", mag_horizontal.x(), mag_horizontal.y());
+                return;  // 이상한 데이터는 무시
+            }
+            
+            // 🔍 4단계: 자력계 heading 계산
+            RCLCPP_INFO(this->get_logger(), "4단계: 자력계 heading 계산");
+            
+            // 자력계 기반 heading 계산 (드리프트 보정용)
+            mag_heading_ = atan2(-mag_horizontal.y(), mag_horizontal.x()) + magnetic_declination_;
+            mag_heading_ = normalizeAngle(mag_heading_);
+            
+            // 🔒 mag_heading_ 최종 유효성 확인
+            if (!std::isfinite(mag_heading_)) {
+                RCLCPP_WARN(this->get_logger(), "자력계 헤딩 계산 실패");
+                return;
+            }
+        }
         
-        // 자력계 기반 heading 계산 (드리프트 보정용)
-        mag_heading_ = atan2(-mag_horizontal.y(), mag_horizontal.x()) + magnetic_declination_;
-        while (mag_heading_ > M_PI) mag_heading_ -= 2.0 * M_PI;
-        while (mag_heading_ <= -M_PI) mag_heading_ += 2.0 * M_PI;
+        // 🔍 5단계: 자력계 안정성 체크
+        RCLCPP_INFO(this->get_logger(), "5단계: 자력계 안정성 체크");
         
         // 자력계 안정성 체크 (settling time 고려)
         double mag_change = abs(mag_heading_ - prev_mag_heading_);
@@ -318,11 +577,17 @@ private:
         }
         prev_mag_heading_ = mag_heading_;
         
+        // 🔍 6단계: 적응형 가중치 계산
+        RCLCPP_INFO(this->get_logger(), "6단계: 적응형 가중치 계산");
+        
         // 적응형 가중치 계산
         double mag_stability_ratio = (double)mag_stable_count_ / MAG_STABLE_THRESHOLD;
         double adaptive_mag_weight = MIN_MAG_WEIGHT + 
             (MAX_MAG_WEIGHT - MIN_MAG_WEIGHT) * mag_stability_ratio;
         double adaptive_gyro_weight = 1.0 - adaptive_mag_weight;
+        
+        // 🔍 7단계: 필터 로직 시작
+        RCLCPP_INFO(this->get_logger(), "7단계: 필터 로직 시작");
         
         // 드리프트 보정만 수행 (실제 움직임은 IMU callback에서 처리됨)
         if (!filter_initialized_) {
@@ -337,8 +602,7 @@ private:
             if (!is_stationary) {
                 // 움직이고 있을 때만 드리프트 보정 적용
                 double heading_error = mag_heading_ - fused_heading_;
-                while (heading_error > M_PI) heading_error -= 2.0 * M_PI;
-                while (heading_error <= -M_PI) heading_error += 2.0 * M_PI;
+                heading_error = normalizeAngle(heading_error);
                 
                 // 매우 작은 드리프트 보정만 적용 (실제 움직임은 억제하지 않음)
                 double drift_correction = adaptive_mag_weight * 0.05 * heading_error;  // 5%로 더 감소
@@ -348,14 +612,19 @@ private:
             // 정지 상태에서는 드리프트 보정 안함 (현재 값 유지)
         }
         
+        // 🔍 8단계: 각도 정규화
+        RCLCPP_INFO(this->get_logger(), "8단계: 각도 정규화");
+        
         // 정규화
-        while (fused_heading_ > M_PI) fused_heading_ -= 2.0 * M_PI;
-        while (fused_heading_ <= -M_PI) fused_heading_ += 2.0 * M_PI;
+        fused_heading_ = normalizeAngle(fused_heading_);
+        
+        // 🔍 9단계: IMU 발행 여부 체크
+        RCLCPP_INFO(this->get_logger(), "9단계: IMU 발행 여부 체크");
         
         // 최소한의 안정성 체크 (품질 좋은 데이터만)
         if (consecutive_good_readings_ >= MIN_GOOD_READINGS) {
-            // 원본 IMU의 orientation을 절대 방향으로 변환
-            auto imu_absolute_msg = std::make_shared<sensor_msgs::msg::Imu>(*latest_imu_);
+            // 🔍 9-1단계: 절대 IMU 생성 시작
+            RCLCPP_INFO(this->get_logger(), "9-1단계: 절대 IMU 생성 시작");
             
             // 원본 IMU의 쿼터니언 가져오기
             tf2::Quaternion original_quat(latest_imu_->orientation.x, 
@@ -364,16 +633,17 @@ private:
                                          latest_imu_->orientation.w);
             original_quat.normalize();
             
-            // 더 안정적인 방법: 쿼터니언 직접 조작으로 yaw 교체
-            // Z축 회전만 추출 (Roll, Pitch 보존)
-            tf2::Matrix3x3 original_rot(original_quat);
-            double roll, pitch, relative_yaw;
-            original_rot.getRPY(roll, pitch, relative_yaw);
+            // 🔍 9-2단계: createAbsoluteIMU 호출 (블로킹 가능!)
+            RCLCPP_INFO(this->get_logger(), "9-2단계: createAbsoluteIMU 호출");
             
-            // 절대 yaw로 새 쿼터니언 생성 (연속성 보장)
-            tf2::Quaternion absolute_quat;
-            absolute_quat.setRPY(roll, pitch, fused_heading_);
-            absolute_quat.normalize();
+            // 🛡️ 순수 쿼터니언 연산으로 절대 IMU 생성 (RPY 변환 없음)
+            tf2::Quaternion absolute_quat = createAbsoluteIMU(original_quat, fused_heading_);
+            
+            // 🔍 9-3단계: IMU 메시지 생성
+            RCLCPP_INFO(this->get_logger(), "9-3단계: IMU 메시지 생성");
+            
+            // 원본 IMU의 orientation을 절대 방향으로 변환
+            auto imu_absolute_msg = std::make_shared<sensor_msgs::msg::Imu>(*latest_imu_);
             
             // 절대 orientation 설정
             imu_absolute_msg->orientation.x = absolute_quat.x();
@@ -383,7 +653,10 @@ private:
             
             // 타임스탬프 업데이트
             imu_absolute_msg->header.stamp = msg->header.stamp;
-            imu_absolute_msg->header.frame_id = "imu_absolute_link";
+            imu_absolute_msg->header.frame_id = "imu_absolute";
+            
+            // 🔍 9-4단계: IMU 발행
+            RCLCPP_INFO(this->get_logger(), "9-4단계: IMU 발행");
             
             imu_absolute_pub_->publish(*imu_absolute_msg);
             
@@ -397,63 +670,62 @@ private:
                 consecutive_good_readings_, MIN_GOOD_READINGS);
         }
         
-        // 통합 디버그 출력 (0.5초마다, 모든 정보 한 줄)
-        static auto last_debug = this->now();
-        if ((this->now() - last_debug).seconds() > 0.5) {  // 3초 → 0.5초로 변경
-            double mag_raw_magnitude = sqrt(msg->magnetic_field.x * msg->magnetic_field.x + 
-                                          msg->magnetic_field.y * msg->magnetic_field.y + 
-                                          msg->magnetic_field.z * msg->magnetic_field.z);
+        // 🔍 10단계: 상세 로그 출력 시작
+        RCLCPP_INFO(this->get_logger(), "10단계: 상세 로그 출력 시작");
+        
+        // 🔍 상세 디버그 출력 (매번 출력으로 변경)
+        double mag_raw_magnitude = sqrt(msg->magnetic_field.x * msg->magnetic_field.x + 
+                                      msg->magnetic_field.y * msg->magnetic_field.y + 
+                                      msg->magnetic_field.z * msg->magnetic_field.z);
+        
+        // 🔍 10-1단계: 안전한 yaw 추출
+        RCLCPP_INFO(this->get_logger(), "10-1단계: 안전한 yaw 추출");
+        
+        // 🛡️ 안전한 yaw 추출 (RPY 변환 없음)
+        tf2::Quaternion raw_quat(latest_imu_->orientation.x, latest_imu_->orientation.y,
+                                latest_imu_->orientation.z, latest_imu_->orientation.w);
+        double raw_yaw = extractYawFromQuaternion(raw_quat);
+        
+        // 🔍 10-2단계: 원시 자력계 각도 계산
+        RCLCPP_INFO(this->get_logger(), "10-2단계: 원시 자력계 각도 계산");
+        
+        // 원시 자력계 각도 (tilt 보정 전)
+        double raw_mag_heading = atan2(-msg->magnetic_field.y, msg->magnetic_field.x) + magnetic_declination_;
+        raw_mag_heading = normalizeAngle(raw_mag_heading);
+        
+        // 🔍 10-3단계: 도(degree) 변환
+        RCLCPP_INFO(this->get_logger(), "10-3단계: 도(degree) 변환");
+        
+        // 각도를 도(degree)로 변환 (0~360도)
+        double raw_yaw_deg = raw_yaw * 180.0 / M_PI;
+        if (raw_yaw_deg < 0) raw_yaw_deg += 360.0;
+        
+        double abs_yaw_deg = fused_heading_ * 180.0 / M_PI;
+        if (abs_yaw_deg < 0) abs_yaw_deg += 360.0;
+        
+        double raw_mag_deg = raw_mag_heading * 180.0 / M_PI;
+        if (raw_mag_deg < 0) raw_mag_deg += 360.0;
+        
+        double fused_deg = fused_heading_ * 180.0 / M_PI;
+        if (fused_deg < 0) fused_deg += 360.0;
+        
+        double gyro_deg = gyro_heading_ * 180.0 / M_PI;
+        if (gyro_deg < 0) gyro_deg += 360.0;
+        
+        double mag_deg = mag_heading_ * 180.0 / M_PI;
+        if (mag_deg < 0) mag_deg += 360.0;
+        
+        // 🔍 10-4단계: 최종 로그 출력
+        RCLCPP_INFO(this->get_logger(), "10-4단계: 최종 로그 출력");
+        
+        // 🎯 상세 로그 (매번 출력)
+        RCLCPP_INFO(this->get_logger(), 
+            "원시Y=%.1f° | 📤절대Y=%.1f° | 자력계=%.1f° 융합=%.1f° 각속도=%.1f° 틸트자력계=%.1f° | 크기=%.1fe-5 | 정지=%d", 
+            raw_yaw_deg, abs_yaw_deg, raw_mag_deg, fused_deg, gyro_deg, mag_deg, 
+            mag_raw_magnitude*1e5, stationary_count_);
             
-            // 원시 IMU 방향 (상대 좌표계)
-            tf2::Quaternion raw_quat(latest_imu_->orientation.x, latest_imu_->orientation.y,
-                                    latest_imu_->orientation.z, latest_imu_->orientation.w);
-            tf2::Matrix3x3 raw_rot(raw_quat);
-            double raw_roll, raw_pitch, raw_yaw;
-            raw_rot.getRPY(raw_roll, raw_pitch, raw_yaw);
-            
-            // 절대 IMU 방향 (발행되는 값)
-            tf2::Quaternion abs_quat;
-            abs_quat.setRPY(raw_roll, raw_pitch, fused_heading_);
-            tf2::Matrix3x3 abs_rot(abs_quat);
-            double abs_roll, abs_pitch, abs_yaw;
-            abs_rot.getRPY(abs_roll, abs_pitch, abs_yaw);
-            
-            // 원시 자력계 각도 (tilt 보정 전)
-            double raw_mag_heading = atan2(-msg->magnetic_field.y, msg->magnetic_field.x) + magnetic_declination_;
-            while (raw_mag_heading > M_PI) raw_mag_heading -= 2.0 * M_PI;
-            while (raw_mag_heading <= -M_PI) raw_mag_heading += 2.0 * M_PI;
-            
-            // 각도를 도(degree)로 변환
-            double raw_roll_deg = raw_roll * 180.0 / M_PI;
-            double raw_pitch_deg = raw_pitch * 180.0 / M_PI;
-            double raw_yaw_deg = raw_yaw * 180.0 / M_PI;
-            if (raw_yaw_deg < 0) raw_yaw_deg += 360.0;
-            
-            double abs_roll_deg = abs_roll * 180.0 / M_PI;
-            double abs_pitch_deg = abs_pitch * 180.0 / M_PI;
-            double abs_yaw_deg = abs_yaw * 180.0 / M_PI;
-            if (abs_yaw_deg < 0) abs_yaw_deg += 360.0;
-            
-            double raw_mag_deg = raw_mag_heading * 180.0 / M_PI;
-            if (raw_mag_deg < 0) raw_mag_deg += 360.0;
-            
-            // 출력용으로만 0~360도 변환
-            double fused_deg = fused_heading_ * 180.0 / M_PI;
-            if (fused_deg < 0) fused_deg += 360.0;
-            double gyro_deg = gyro_heading_ * 180.0 / M_PI;
-            if (gyro_deg < 0) gyro_deg += 360.0;
-            double mag_deg = mag_heading_ * 180.0 / M_PI;
-            if (mag_deg < 0) mag_deg += 360.0;
-            
-            RCLCPP_INFO(this->get_logger(), 
-                "원시IMU: R=%.1f° P=%.1f° Y=%.1f° | 📤절대IMU: R=%.1f° P=%.1f° Y=%.1f° | 원시자력계=%.1f° 융합=%.1f° 각속도=%.1f° 틸트보정자력계=%.1f° | 자력계크기=%.1fe-5 안정성=%d/10 가중치=%.1f%% | 정지=%d/%d", 
-                raw_roll_deg, raw_pitch_deg, raw_yaw_deg,
-                abs_roll_deg, abs_pitch_deg, abs_yaw_deg,
-                raw_mag_deg, fused_deg, gyro_deg, mag_deg, 
-                mag_raw_magnitude*1e5, mag_stable_count_, adaptive_mag_weight*100,
-                stationary_count_, MIN_STATIONARY_COUNT);
-            last_debug = this->now();
-        }
+        // 🔍 자력계 콜백 완료 로그
+        RCLCPP_INFO(this->get_logger(), "magnetometer_main 토픽 데이터 처리 완료");
     }
     
     bool loadCalibrationParameters()
@@ -614,6 +886,47 @@ private:
         tf_broadcaster_->sendTransform(original_transform);
         tf_broadcaster_->sendTransform(absolute_transform);
         tf_broadcaster_->sendTransform(north_transform);
+    }
+
+    void publishIMUOnly()
+    {
+        if (!latest_imu_ || !filter_initialized_) {
+            RCLCPP_WARN(this->get_logger(), "IMU 데이터 없음 또는 필터 미초기화 - 발행 건너뜀");
+            return;
+        }
+
+        // 🔧 자력계 보정 없이 현재 fused_heading_만 사용해서 IMU 발행
+        tf2::Quaternion original_quat(latest_imu_->orientation.x, 
+                                     latest_imu_->orientation.y,
+                                     latest_imu_->orientation.z, 
+                                     latest_imu_->orientation.w);
+        original_quat.normalize();
+        
+        // 현재 융합된 heading으로 절대 IMU 생성
+        tf2::Quaternion absolute_quat = createAbsoluteIMU(original_quat, fused_heading_);
+        
+        // IMU 메시지 생성 및 발행
+        auto imu_absolute_msg = std::make_shared<sensor_msgs::msg::Imu>(*latest_imu_);
+        imu_absolute_msg->orientation.x = absolute_quat.x();
+        imu_absolute_msg->orientation.y = absolute_quat.y();
+        imu_absolute_msg->orientation.z = absolute_quat.z();
+        imu_absolute_msg->orientation.w = absolute_quat.w();
+        imu_absolute_msg->header.stamp = this->now();
+        imu_absolute_msg->header.frame_id = "imu_absolute";
+        
+        imu_absolute_pub_->publish(*imu_absolute_msg);
+        
+        // 간단한 로그
+        double raw_yaw = extractYawFromQuaternion(original_quat);
+        double raw_yaw_deg = raw_yaw * 180.0 / M_PI;
+        if (raw_yaw_deg < 0) raw_yaw_deg += 360.0;
+        
+        double abs_yaw_deg = fused_heading_ * 180.0 / M_PI;
+        if (abs_yaw_deg < 0) abs_yaw_deg += 360.0;
+        
+        RCLCPP_INFO(this->get_logger(), 
+            "원시Y=%.1f° | 📤절대Y=%.1f° | 🚨자력계 보정 없음 | 정지=%d", 
+            raw_yaw_deg, abs_yaw_deg, stationary_count_);
     }
 };
 
